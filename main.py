@@ -1,20 +1,28 @@
 import time
-import numpy as np
-import faiss
 import os
+import json
+import faiss
+import numpy as np
+
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import json
 
-# Load models
+from sentence_transformers import SentenceTransformer, CrossEncoder
+
+# ------------------------
+# Load Models (cached in memory)
+# ------------------------
+
 print("Loading embedding model...")
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-print("Loading rerank model...")
+print("Loading reranking model...")
 rerank_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
+# ------------------------
 # Load documents
+# ------------------------
+
 print("Loading documents...")
 with open("documents.json", "r") as f:
     docs = json.load(f)
@@ -22,25 +30,43 @@ with open("documents.json", "r") as f:
 doc_texts = [d["content"] for d in docs]
 doc_ids = [d["id"] for d in docs]
 
-# Compute embeddings
-print("Computing embeddings...")
-doc_embeddings = embed_model.encode(doc_texts, normalize_embeddings=True)
+# ------------------------
+# Compute embeddings ONCE (cached)
+# ------------------------
 
-# FAISS index
+print("Computing embeddings...")
+doc_embeddings = embed_model.encode(
+    doc_texts,
+    normalize_embeddings=True,
+    convert_to_numpy=True
+)
+
+# ------------------------
+# Build FAISS index
+# ------------------------
+
 dimension = doc_embeddings.shape[1]
+
 index = faiss.IndexFlatIP(dimension)
 index.add(doc_embeddings)
 
-print("FAISS index ready")
+print(f"FAISS ready with {len(docs)} docs")
 
-# API setup
-app = FastAPI()
+# ------------------------
+# FastAPI app
+# ------------------------
+
+app = FastAPI(title="Semantic Search API")
 
 
 @app.get("/")
 def home():
-    return {"message": "API is running successfully!"}
+    return {"status": "running", "docs": len(docs)}
 
+
+# ------------------------
+# Request schema
+# ------------------------
 
 class QueryRequest(BaseModel):
     query: str
@@ -49,42 +75,66 @@ class QueryRequest(BaseModel):
     rerankK: int = 5
 
 
-def normalize(scores):
-    min_s, max_s = min(scores), max(scores)
-    if max_s == min_s:
-        return [1.0] * len(scores)
-    return [(float(s) - float(min_s)) / (float(max_s) - float(min_s)) for s in scores]
+# ------------------------
+# Normalize scores 0–1
+# ------------------------
 
+def normalize(scores):
+
+    scores = np.array(scores)
+
+    if scores.max() == scores.min():
+        return np.ones(len(scores))
+
+    return (scores - scores.min()) / (scores.max() - scores.min())
+
+
+# ------------------------
+# SEARCH ENDPOINT
+# ------------------------
 
 @app.post("/search")
 def search(req: QueryRequest):
 
-    start = time.time()
+    start_time = time.time()
 
-    query_emb = embed_model.encode([req.query], normalize_embeddings=True)
+    # embed query
+    query_embedding = embed_model.encode(
+        [req.query],
+        normalize_embeddings=True,
+        convert_to_numpy=True
+    )
 
-    scores, indices = index.search(query_emb, req.k)
+    # vector search
+    scores, indices = index.search(query_embedding, req.k)
 
     candidates = []
+
     for score, idx in zip(scores[0], indices[0]):
+
         candidates.append({
             "id": int(doc_ids[idx]),
             "content": doc_texts[idx],
-            "score": float(score),
-            "metadata": docs[idx]["metadata"]
+            "metadata": docs[idx]["metadata"],
+            "score": float(score)
         })
 
     reranked = False
 
-    if req.rerank:
+    # ------------------------
+    # RERANK STEP
+    # ------------------------
+
+    if req.rerank and len(candidates) > 0:
 
         pairs = [(req.query, c["content"]) for c in candidates]
+
         rerank_scores = rerank_model.predict(pairs)
 
-        norm_scores = normalize(rerank_scores)
+        normalized_scores = normalize(rerank_scores)
 
-        for i, c in enumerate(candidates):
-            c["score"] = float(norm_scores[i])
+        for i in range(len(candidates)):
+            candidates[i]["score"] = float(normalized_scores[i])
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
@@ -92,11 +142,14 @@ def search(req: QueryRequest):
 
         reranked = True
 
-    latency = int((time.time() - start) * 1000)
+    latency = int((time.time() - start_time) * 1000)
 
     return {
+
         "results": candidates,
+
         "reranked": reranked,
+
         "metrics": {
             "latency": latency,
             "totalDocs": len(docs)
@@ -104,9 +157,14 @@ def search(req: QueryRequest):
     }
 
 
-# IMPORTANT: Render needs this
+# ------------------------
+# Render PORT FIX
+# ------------------------
+
 if __name__ == "__main__":
+
     import uvicorn
+
     port = int(os.environ.get("PORT", 10000))
-    print(f"Starting server on port {port}")
+
     uvicorn.run(app, host="0.0.0.0", port=port)
